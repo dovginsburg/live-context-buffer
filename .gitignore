@@ -34,3 +34,12 @@ license_preview.png
 
 # Agent ops
 agentops.log
+
+# Hermes internal plans and scratch
+.hermes/
+
+# Unrelated workspace files
+create_parah_docx.py
+ezra-admin-wrapper.sh
+verify_rachio.py
+GOOGLE_WORKSPACE_SETUP.md
