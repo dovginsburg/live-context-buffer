@@ -1,3 +1,0 @@
-2026-05-16 19:41:52,664 - INFO - Session Replay for default trace: https://app.agentops.ai/sessions?trace_id=1479b94a090a07e67c685cf41557075c
-2026-05-16 19:41:52,963 - ERROR - [agentops.InternalSpanProcessor] Error uploading logfile: Upload failed: 401
-2026-05-16 19:41:53,259 - INFO - Session Replay for default.session trace: https://app.agentops.ai/sessions?trace_id=1479b94a090a07e67c685cf41557075c
