@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ezra.ttyd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/ttyd</string>
+        <string>--port</string>
+        <string>8022</string>
+        <string>--max-clients</string>
+        <string>3</string>
+        <string>-W</string>
+        <string>--credential</string>
+        <string>dov:Wg2vgr84JLqNI7M2KyxkP15p</string>
+        <string>bash</string>
+        <string>-l</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/Ezra/.hermes/logs/ttyd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Ezra/.hermes/logs/ttyd.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

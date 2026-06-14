@@ -1,0 +1,21 @@
+# /etc/sudoers.d/ezra-admin
+# Install with: sudo visudo -f /etc/sudoers.d/ezra-admin
+
+User_Alias EZRAUSER = Ezra
+Cmnd_Alias EZRAADMIN = \
+    /usr/local/bin/ezra-admin-wrapper.sh restart-gateway, \
+    /usr/local/bin/ezra-admin-wrapper.sh backup-hermes-env, \
+    /usr/local/bin/ezra-admin-wrapper.sh set-hermes-env *, \
+    /usr/local/bin/ezra-admin-wrapper.sh install-bin * *, \
+    /usr/local/bin/ezra-admin-wrapper.sh write-sshd-conf *, \
+    /usr/local/bin/ezra-admin-wrapper.sh set-remotelogin *, \
+    /usr/local/bin/ezra-admin-wrapper.sh set-ssh-authorized-keys *, \
+    /usr/local/bin/ezra-admin-wrapper.sh install-launch-agent *, \
+    /usr/local/bin/ezra-admin-wrapper.sh restart-sshd, \
+    /usr/local/bin/ezra-admin-wrapper.sh tailscale-funnel-set * *, \
+    /usr/local/bin/ezra-admin-wrapper.sh tailscale-funnel-off *, \
+    /usr/local/bin/ezra-admin-wrapper.sh write-resolver-file * *, \
+    /usr/local/bin/ezra-admin-wrapper.sh load-launch-daemon *
+
+EZRAUSER ALL=(root) NOPASSWD: EZRAADMIN
+Defaults!EZRAADMIN !requiretty
