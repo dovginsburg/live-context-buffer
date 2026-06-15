@@ -1,90 +1,166 @@
 # Live Context Buffer
 
-A production-tested memory and context system for AI agents on WhatsApp.
+A Hermes Agent plugin that injects recent chat context into the current LLM
+turn. Generalizes the `history_backfill` pattern used by the built-in Discord
+adapter so WhatsApp, iMessage, Telegram, and other platforms get the same
+"what just happened" buffer.
 
-## What this solves
+## What this is
 
-AI agents on WhatsApp lose context between sessions. They can't see images properly, forget quoted messages, and break when the API rate-limits hit. This system fixes that.
+A single `pre_llm_call` hook plugin (~880 lines, no external dependencies)
+that:
 
-## Components
+1. Reads the last N messages from the active session transcript
+2. Filters out reactions, voice memo stubs, and other non-substantive
+   content
+3. Picks the most relevant 3-15 messages within a 400-token budget
+4. Optionally summarizes older messages within a separate 80-token budget
+5. Optionally attaches recent image descriptions (60 tokens)
+6. Optionally applies priority scoring, adaptive window sizing, and
+   entity tracking
+7. Returns a `{"context": "..."}` dict that Hermes injects into the user
+   message (never the system prompt, so the prompt cache stays stable)
 
-### 1. Vision Pipeline Fix
-- Swaps OpenCode Zen proxy (20 req/day cap) for direct Gemini API
-- Dedicated API key per consumer (no shared quota starvation)
-- Config: `config.yaml` → `auxiliary.vision`
+The hook fires on **every** LLM call (CLI, WhatsApp, iMessage, Telegram,
+Discord) but its effect is platform-specific — see the `platforms:` config
+block below.
 
-### 2. Quoted Message Context
-- Bridge extracts full quoted message text from WhatsApp contextInfo
-- Gateway populates `reply_to_message_id` and `reply_to_text` in MessageEvent
-- Agent can now see what someone replied to, not just that they replied
-- Files: `scripts/whatsapp-bridge/bridge.js`, `gateway/platforms/whatsapp.py`
+## Phases
 
-### 3. Group Chat Routing
-- Tags control OUTPUT only, not INPUT — all messages observed regardless
-- Silent observation enables later reference ("describe the image above")
-- Router delivery counts as address even without explicit tag
-- Config: `observe_unmentioned_group_messages: true`
+| Phase | Feature | Status |
+|-------|---------|--------|
+| 1 | Sliding window of recent messages (verbatim) | implemented |
+| 2 | Extractive summary of older messages (zero-cost) | implemented |
+| 3 | Image description injection from cached images | implemented |
+| 4 | Per-platform config overrides, edge case hardening | implemented |
+| 5 | Priority scoring, adaptive window, entity tracking | implemented |
 
-### 4. Memory Architecture (T0/T1/T2/T3)
+All five phases ship in the current code. Phase 1 alone gives most of the
+value; phases 2-5 are progressive refinements that can be disabled in
+config.
 
-| Tier | System | Purpose |
-|------|--------|---------|
-| T0 | Prompt memory (MEMORY.md + USER.md) | Operational rules, always-loaded pointer layer |
-| T1 | Obsidian + Registries | Authoritative canonical facts |
-| T2 | Hindsight | Advisory semantic recall, conversational memory |
-| T3 | GBrain | Embedded corpus for long-form retrieval |
+## Install
 
-**Key principles:**
-- T0 is a cache, not source of truth
-- Registries (`people.yml`, `policies.yml`, `systems.yml`) are the operational foundation
-- T2 (Hindsight) never overwrites T1 (Obsidian)
-- Daily LLM offload captures stable facts before context compaction
-
-## Quick Start
+This plugin lives at `~/.hermes/plugins/live_context/` in a standard
+Hermes install. To install it elsewhere:
 
 ```bash
-# Vision: swap to direct Gemini API
-# In config.yaml, replace auxiliary.vision section:
-auxiliary:
-  vision:
-    api_key: <your-gemini-api-key>
-    base_url: https://generativelanguage.googleapis.com/v1beta
-    model: gemini-2.5-flash
-    provider: gemini
-    timeout: 120
+# Clone this repo
+git clone https://github.com/dovginsburg/live-context-buffer.git
+cd live-context-buffer
 
-# Bridge: quoted message text extraction
-# Already included in bridge.js — just restart gateway:
-hermes gateway restart
+# Copy the plugin into your Hermes install
+mkdir -p ~/.hermes/plugins/live_context
+cp plugins/live_context/__init__.py ~/.hermes/plugins/live_context/
+cp plugins/live_context/plugin.yaml ~/.hermes/plugins/live_context/
 
-# Group chat observation
-# In config.yaml:
-whatsapp:
-  extra:
-    require_mention: true
-    observe_unmentioned_group_messages: true
+# Enable the plugin
+hermes plugins enable live_context
 ```
+
+## Config
+
+Add a `live_context:` block to the profile's `config.yaml`. Per-profile
+scoping is intentional — typically you only want this on the chat
+profile (`ezra_chat`), not on the CLI profile (`default`):
+
+```yaml
+# In ~/.hermes/profiles/<name>/config.yaml
+live_context:
+  enabled: true
+  max_messages: 15           # upper bound on the sliding window
+  max_tokens: 400            # token budget for the window
+  time_window_minutes: 30    # ignore messages older than this
+  min_messages: 3            # always include at least this many if available
+  summary:
+    enabled: true
+    max_tokens: 80           # budget for the older-message summary
+    min_messages: 3          # only summarize if ≥ this many older messages
+  images:
+    max_count: 3
+    max_tokens: 60
+  platforms:
+    whatsapp: {}
+    discord:
+      enabled: false         # Discord already has history_backfill built in
+    telegram:
+      max_messages: 20
+      max_tokens: 500
+    imessage:
+      max_messages: 10
+    slack: {}
+    signal: {}
+  smart:
+    priority_scoring: true   # boost important messages in window
+    adaptive_window: true    # adjust window size by message density
+    entity_tracking: true    # track active participants
+    entity_header: true      # show entity line in context block
+```
+
+## What it does NOT do
+
+- **Does not fix the iMessage-not-responding problem.** If iMessage
+  messages reach the Mac but don't trigger an agent run, that's a
+  routing/adapter issue (`hermes-gateway-bluebubbles-debug`), not a
+  context buffer issue. This plugin only helps when messages *do* reach
+  the agent — it gives the agent better memory of what was said
+  before.
+- **Does not add new storage.** Reads from the existing session
+  transcript in `state.db`. The sliding window is recomputed on every
+  LLM call.
+- **Does not modify the system prompt.** Injected context always goes
+  into the user message, preserving the prompt cache prefix.
+- **Does not persist injected context.** Each turn's context is
+  ephemeral; the session DB only contains the actual user/assistant
+  exchanges, not the backfill block.
 
 ## Architecture
 
 ```
-WhatsApp Bridge (Node.js)
-  ↓ extracts: mentionedIds, quotedMessageId, quotedText, mediaUrls
-  ↓ downloads images to ~/.hermes/image_cache/
-Gateway (Python)
-  ↓ builds MessageEvent with reply_to_message_id, reply_to_text
-  ↓ pre-analyzes images with vision_analyze (Gemini)
-  ↓ routes: tag gate → observe or dispatch
-Agent
-  ↓ receives full context: text + quoted text + image descriptions
-  ↓ can reference prior observed messages
+                ┌──────────────────────────────────────────┐
+                │  Hermes Agent (per-profile)              │
+                │                                          │
+inbound msg ──▶ │  gateway adapter                         │
+                │    │                                     │
+                │    ▼                                     │
+                │  agent loop ──▶ pre_llm_call hook        │
+                │                  │                       │
+                │                  ▼                       │
+                │          live_context plugin            │
+                │            │              │              │
+                │            ▼              ▼              │
+                │      session db    image cache          │
+                │      (state.db)    (~/.hermes/)         │
+                │            │              │              │
+                │            └──────┬───────┘              │
+                │                   ▼                      │
+                │          formatted context block         │
+                │                   │                      │
+                │                   ▼                      │
+                │          injected into user message      │
+                │                   │                      │
+                │                   ▼                      │
+                │              LLM call                    │
+                └──────────────────────────────────────────┘
 ```
 
-## Files Modified
+## Token budget
 
-- `gateway/platforms/whatsapp.py` — reply_to fields in MessageEvent
-- `scripts/whatsapp-bridge/bridge.js` — quotedText extraction from contextInfo
-- `config.yaml` — vision provider swap (OpenCode Zen → direct Gemini)
+- Window: 400 tokens (configurable, 0.39% of a 128K context)
+- Summary: 80 tokens (configurable)
+- Images: 60 tokens (configurable)
+- Total: ~540 tokens/turn at default settings
+
+## Files
+
+- `plugins/live_context/__init__.py` — the plugin (register + on_pre_llm_call)
+- `plugins/live_context/plugin.yaml` — plugin manifest (name, hooks)
+
+## Why "Phase 5 (Complete)" is in the docstring
+
+The plugin shipped all five phases on 2026-06-14 in a single drop. The
+docstring calls out the phases so future readers can disable or tune
+each independently.
 
 ## License
 

@@ -1,0 +1,6 @@
+name: live_context
+version: "0.1.0"
+description: "Injects recent observed chat context into the current turn, giving the agent a 'what just happened' buffer without reinjecting full history. Generalizes Discord's history_backfill pattern to all platforms."
+author: Ezra
+hooks:
+  - pre_llm_call
