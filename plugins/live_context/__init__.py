@@ -1,5 +1,5 @@
 """
-Live Context Buffer Plugin — Phase 5 (Complete)
+Live Context Buffer Plugin — Phase 6 (Complete)
 ================================================
 
 Injects recent observed chat context into the current turn via the
@@ -12,6 +12,10 @@ Phases:
   Phase 3: Image description injection from cached images
   Phase 4: Per-platform config overrides, edge case hardening, observability
   Phase 5: Priority scoring, adaptive window, entity tracking
+  Phase 6: Q&A preservation in summary — when a question is followed by
+    a direct answer in the older-message pool, preserve the answer as a
+    readable sentence (e.g. "Q&A: Q: what's better than sex? A: Sleep")
+    prioritized above the keyword dump. Keeps the 80-token budget intact.
 
 Config (in config.yaml):
     live_context:
@@ -198,6 +202,18 @@ _CACHED_IMAGE_RE = re.compile(
     r"(img_[a-f0-9]{8,16}\.(?:jpg|jpeg|png|webp|gif))",
     re.IGNORECASE,
 )
+# Dov 2026-06-15: format produced by the group-observer path
+# (`gateway/platforms/_group_observer.py:_attributed_text` and
+# `_default_retain`). The observer downloads media to the local cache
+# and embeds the path as `[<kind> cached: <path>]` so future
+# sessions can vision_analyze(path) on demand. The live_context
+# plugin's image collector must surface this so the agent knows
+# the path is on disk and can call vision_analyze.
+_OBSERVER_CACHED_RE = re.compile(
+    r"\[\s*(?:image|video|audio|document|sticker|reaction|attachment)"
+    r"(?:\s+cached)?:\s*([^\]\n]+)\]",
+    re.IGNORECASE,
+)
 _IMAGE_INLINE_RE = re.compile(
     r"\[image:\s*([^\]]+)\]",
     re.IGNORECASE,
@@ -251,11 +267,6 @@ _SENDER_PLAIN_RE = re.compile(r'^\[([^\]]+)\]\s*(.*)', re.DOTALL)
 
 
 def _extract_sender_from_content(content: str) -> Tuple[str, str]:
-    # Try the most specific form first: "[display_name|user_id]".
-    # The pipe-regex requires at least one char in the display-name slot
-    # ([^\]|]+), so an empty-name form like "[|abc@lid]" falls through
-    # to the plain form, which returns "|abc@lid" verbatim — acceptable
-    # as a raw identifier (no real conversation produces this anyway).
     m = _SENDER_PIPE_RE.match(content)
     if m:
         return m.group(1).strip(), m.group(2).strip()
@@ -486,6 +497,16 @@ def _extract_image_references(content: str) -> List[Dict[str, str]]:
     for m in _IMAGE_INLINE_RE.finditer(content):
         refs.append({"type": "inline", "path": "", "description": m.group(1).strip()[:100]})
 
+    # Dov 2026-06-15: group-observer-cached format (`[<kind> cached: <path>]`).
+    # These are real local file paths the agent can call vision_analyze
+    # on. The format marker tells the agent the path is *on disk* and
+    # ready for analysis, rather than a description-only inline.
+    for m in _OBSERVER_CACHED_RE.finditer(content):
+        path = m.group(1).strip()
+        if not path or not path.startswith("/"):
+            continue
+        refs.append({"type": "observer_cached", "path": path, "description": ""})
+
     return refs
 
 
@@ -499,6 +520,13 @@ def _format_image_ref(ref: Dict[str, str]) -> str:
         return f"[Image: {ref['path']}]"
     elif ref["type"] == "inline" and ref["description"]:
         return f"[Image: {ref['description']}]"
+    # Dov 2026-06-15: group-observer-cached paths. The format
+    # is intentional — `[Image: /path/...]` with the actual
+    # local cache path so the agent can vision_analyze(path) on
+    # the next turn. We add a hint marker so the agent knows
+    # the path is on disk and ready (vs an inline description).
+    elif ref["type"] == "observer_cached" and ref["path"]:
+        return f"[Image on disk: {ref['path']}]"
     return ""
 
 
@@ -568,6 +596,114 @@ def _has_image_reference(text: str) -> bool:
     return bool(_CACHED_IMAGE_RE.search(text) or _IMAGE_INLINE_RE.search(text) or _WHATSAPP_IMAGE_RE.search(text))
 
 
+# Phase 6: a "short direct answer" is short enough to preserve verbatim
+# in the summary without blowing the 80-token budget, but long enough to
+# carry substance (not a one-word "ok" or "yes"). 80 chars / ~15 words is
+# the sweet spot — captures "Sleep. Nothing else comes close. You reboot
+# your whole system." (73 chars) while excluding a bare "k" or "ok".
+_MAX_QA_ANSWER_CHARS = 120
+_MIN_QA_ANSWER_CHARS = 3
+
+
+def _extract_qa_pairs(messages: List[Dict[str, Any]]) -> List[str]:
+    """Phase 6: detect Q&A pairs from a list of older-message dicts.
+
+    A Q&A pair is detected when message N contains a question mark
+    (a real question, not a URL or a "?" inside a code block) AND
+    message N+1 is a substantive short answer from a different sender.
+
+    Returns a list of pre-formatted strings like
+        "Levi: Sleep. Nothing else comes close. You reboot your whole system."
+    suitable for inclusion in the summary. Max 3 pairs, in arrival order.
+
+    Why this exists: the previous summarizer reduced "Levi's detailed
+    answers about Knicks parade strategy, White House, and LCB predictions"
+    down to "Topics: gary, lcb, zach, tell, yes" — losing the actual
+    substance. Q&A pairs carry much more signal than a keyword dump, so
+    we preserve them as readable sentences and drop the topic keywords
+    if the budget is tight.
+    """
+    pairs: List[str] = []
+
+    # Iterate consecutive message pairs. We need raw text (with sender
+    # tag) to extract the sender, and the body to detect the question.
+    parsed: List[Tuple[str, str, str]] = []  # (sender, body, raw)
+    for msg in messages:
+        raw = _raw_text(msg)
+        if not raw:
+            continue
+        sender, body = _extract_sender_from_content(raw)
+        parsed.append((sender, body, raw))
+
+    for i in range(len(parsed) - 1):
+        if len(pairs) >= 3:
+            break
+
+        sender_q, body_q, _ = parsed[i]
+        sender_a, body_a, _ = parsed[i + 1]
+
+        if not body_q or not body_a:
+            continue
+
+        # Strip leading "Re:" or ">" quote markers — those are replies, not
+        # a fresh question/answer pair (and the "?" inside a quote is
+        # inherited context, not the speaker's own question).
+        body_q_stripped = body_q.lstrip()
+        if body_q_stripped.startswith((">", "Re:", "RE:", "re:")):
+            continue
+
+        # Dov 2026-06-16 (Phase 6 followup): also skip when the *answer*
+        # body starts with a quote marker. Observed in group chats where a
+        # person responds to "what about gary?" by quoting the question
+        # back ("> what about gary? He is a friend") — that's a
+        # half-acknowledgement, not a real answer, and the doubled-up
+        # content inflates the summary with no extra signal.
+        body_a_stripped = body_a.lstrip()
+        if body_a_stripped.startswith(">"):
+            continue
+
+        # Real question: contains "?" but not inside brackets/code.
+        # The simplest robust check is "has a ? and is not a URL"
+        # — bare "?" in plain text is overwhelmingly a question in chat.
+        if "?" not in body_q:
+            continue
+
+        # Different sender — otherwise it's someone continuing their own
+        # thought, not a Q&A exchange. (Self-replies to your own question
+        # are still captured as Q&A — but in practice a self-Q&A is the
+        # same person elaborating, which is a low-value pair.)
+        if not sender_a or sender_a == sender_q:
+            continue
+
+        # Answer is short enough to preserve verbatim but long enough
+        # to carry substance. Newlines collapse to spaces so the summary
+        # stays one line per pair. Trailing punctuation is normalized
+        # so the final summary joiner ("; ") doesn't produce doubled
+        # periods like "Sleep... . Topics:".
+        answer = " ".join(body_a.split()).strip().rstrip(".!?,")
+        if len(answer) < _MIN_QA_ANSWER_CHARS or len(answer) > _MAX_QA_ANSWER_CHARS:
+            continue
+
+        # Filter out pure acknowledgement answers ("ok", "yes", "lol",
+        # "k", "👍", "?") — these don't carry substance the agent can
+        # act on. The same stop-word set used elsewhere is overkill
+        # here; we use a small hand-picked set.
+        ack_only = answer.lower().strip(" .!?,;:\n\t")
+        if ack_only in {
+            "ok", "okay", "k", "kk", "yes", "no", "yeah", "yep", "nope",
+            "lol", "haha", "lmao", "lmfao", "right", "sure", "true",
+            "false", "maybe", "idk", "dunno", "hi", "hello", "hey",
+            "thanks", "thank you", "ty", "thx", "good", "nice", "cool",
+            "agreed", "same", "ditto", "exactly", "correct", "wrong",
+            "100", "💯", "👍", "👎", "🙏", "❤️", "🔥", "😂",
+        }:
+            continue
+
+        pairs.append(f"{sender_a}: {answer}")
+
+    return pairs
+
+
 def _summarize_messages(
     messages: List[Dict[str, Any]],
     max_tokens: int = 80,
@@ -606,8 +742,33 @@ def _summarize_messages(
     if msg_count == 0:
         return ""
 
+    # Phase 6: extract Q&A pairs FIRST — they carry the highest information
+    # density and should be preserved as readable sentences instead of
+    # being boiled down to a keyword dump. Token budget is allocated
+    # top-down: Q&A → Decisions → Participants → Topics → Media. Lower
+    # sections get dropped (not truncated) if the budget is tight.
+    qa_pairs = _extract_qa_pairs(messages)
+
     parts = []
     token_budget = max_tokens
+
+    if qa_pairs:
+        # Each Q&A pair is roughly `Sender: <answer>` ≈ 15-25 tokens.
+        # Pack as many as fit. Cap at 3 pairs (matches the helper's cap).
+        qa_text = "; ".join(qa_pairs)
+        qa_line = f"Q&A: {qa_text}"
+        t = _estimate_tokens(qa_line)
+        if t <= token_budget:
+            parts.append(qa_line)
+            token_budget -= t
+
+    if all_decisions:
+        dec_text = "; ".join(all_decisions[:2])
+        dec_line = f"Decisions: {dec_text}"
+        t = _estimate_tokens(dec_text)
+        if t <= token_budget:
+            parts.append(dec_line)
+            token_budget -= t
 
     if participants:
         top = participants.most_common(4)
@@ -618,21 +779,19 @@ def _summarize_messages(
             parts.append(participant_line)
             token_budget -= t
 
-    top_topics = [w for w, c in all_keywords.most_common(5) if c >= 1]
-    if top_topics:
-        topic_line = f"Topics: {', '.join(top_topics)}"
-        t = _estimate_tokens(topic_line)
-        if t <= token_budget:
-            parts.append(topic_line)
-            token_budget -= t
-
-    if all_decisions:
-        dec_text = "; ".join(all_decisions[:2])
-        dec_line = f"Decisions: {dec_text}"
-        t = _estimate_tokens(dec_text)
-        if t <= token_budget:
-            parts.append(dec_line)
-            token_budget -= t
+    # Topics are the lowest-value section in the new ordering — a
+    # keyword dump like "Topics: gary, lcb, zach" is what we're trying
+    # to escape. Only include them if there's still room AFTER Q&A +
+    # decisions + participants. The Dov 2026-06-16 fix: explicit cap
+    # at 3 topics (was 5) to free tokens for the higher-signal lines.
+    if all_keywords and token_budget > 0:
+        top_topics = [w for w, c in all_keywords.most_common(3) if c >= 1]
+        if top_topics:
+            topic_line = f"Topics: {', '.join(top_topics)}"
+            t = _estimate_tokens(topic_line)
+            if t <= token_budget:
+                parts.append(topic_line)
+                token_budget -= t
 
     if image_count > 0:
         img_line = f"Media: {image_count} image(s) shared"
@@ -918,4 +1077,4 @@ def on_pre_llm_call(
 
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
-    logger.debug("[live_context] Plugin registered — pre_llm_call hook active (Phase 5: smart)")
+    logger.debug("[live_context] Plugin registered — pre_llm_call hook active (Phase 6: q&a)")
