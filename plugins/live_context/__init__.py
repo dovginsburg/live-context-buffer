@@ -246,6 +246,18 @@ def _is_reaction_or_trivial(content: str) -> bool:
         return True
     if _SYSTEM_CONTENT_RE.match(stripped):
         return True
+    # Phase 7 (Dov 2026-06-16): if the content is `[Sender] <short>`,
+    # strip the sender bracket and test the body alone. Otherwise a
+    # message like `[Levi] 👍` (8 chars) bypasses the length check even
+    # though the body is purely a reaction. This is the #1 source of
+    # emoji-reactions leaking into the verbatim window.
+    sender, body = _extract_sender_from_content(content)
+    if sender and body:
+        body_stripped = body.strip()
+        if len(body_stripped) <= 3:
+            return True
+        if _REACTION_RE.match(body_stripped):
+            return True
     return False
 
 
@@ -316,6 +328,14 @@ def _format_message(msg: Dict[str, Any]) -> Optional[str]:
     if not content or not content.strip():
         return None
     if _is_reaction_or_trivial(content):
+        return None
+
+    # Phase 7 (Dov 2026-06-16): reactions (👍, ❤️, single emoji, "k", etc.)
+    # are filtered here so they don't pollute the verbatim window. They
+    # still appear in the summary as short "[Sender]: [👍 reaction]"
+    # markers so no message is silently dropped.
+    raw = _raw_text(msg)
+    if raw and _is_reaction_or_trivial(raw):
         return None
 
     sender, text = _extract_sender_from_content(content)
@@ -704,106 +724,152 @@ def _extract_qa_pairs(messages: List[Dict[str, Any]]) -> List[str]:
     return pairs
 
 
+def _compress_message_for_summary(
+    raw: str,
+    max_chars: int = 80,
+) -> str:
+    """Phase 7: produce a one-line per-sender summary of a single message.
+
+    The output is a short sender-tagged fragment suitable for joining
+    inside a single ``**Earlier:**`` line. Format:
+
+        ``[Levi]: Tesla Model Y, plate LBE2036``
+
+    Goal: even in compressed form the agent can answer "what did
+    <sender> say about <topic>?" by matching the sender tag + a few
+    key nouns from the body. This replaces the old "Topics: lcb, gary,
+    levi" keyword dump that lost the actual content.
+
+    The compression keeps the first N characters of the body (minus
+    common fillers), with newlines collapsed to spaces. If the message
+    is a reaction/emoji we emit a short ``[👍 reaction]`` marker so it
+    is still *present* in the output without inflating the budget.
+    """
+    sender, body = _extract_sender_from_content(raw)
+    text = " ".join((body or "").split()).strip()
+    if not text:
+        text = "[empty]"
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    if sender:
+        return f"[{sender}]: {text}"
+    return f"[User]: {text}"
+
+
 def _summarize_messages(
     messages: List[Dict[str, Any]],
     max_tokens: int = 80,
 ) -> str:
+    """Phase 7 summary: per-sender one-liners for EVERY older message.
+
+    Key property (Dov 2026-06-16, Phase 7): NO message is dropped.
+    Every older user message becomes a short ``[Sender]: <text>`` line,
+    joined with ``; `` inside a single ``**Earlier:**`` block. If the
+    total exceeds the budget we progressively truncate the *body* of
+    each line (not the line count) so every sender still appears at
+    least once. This is the inverse of the old behaviour — instead of
+    ``Topics: gary, lcb, zach`` we get
+    ``[Levi]: Tesla Model Y plate LBE2036; [Dov]: what car does zach
+    drive; [Levi]: white; [Zach]: Model Y Performance; ...`` — the
+    agent can actually answer "what did Levi say about Zach's car?".
+
+    The summary is built in *arrival order* (chronological) so the
+    agent can follow the conversation flow. Decisions, Q&A pairs,
+    and image counts are no longer separate sections — they're
+    already represented as their own one-liners in the per-message
+    stream. This eliminates the keyword-dump failure mode.
+    """
     if not messages:
         return ""
 
-    participants: Counter = Counter()
-    all_keywords: Counter = Counter()
-    all_decisions: List[str] = []
-    image_count = 0
-    msg_count = 0
-
+    # Build per-message one-liners in arrival order (oldest first).
+    # We track image decisions inline so the agent still knows "X
+    # shared a photo" even when the path itself was already extracted
+    # into the image block above.
+    lines: List[str] = []
     for msg in messages:
         raw = _raw_text(msg)
         if not raw:
             continue
-        msg_count += 1
-
-        sender, _ = _extract_sender_from_content(raw)
-        if sender:
-            participants[sender] += 1
-        else:
-            participants["others"] += 1
-
-        kws = _extract_keywords(raw, max_keywords=3)
-        for kw in kws:
-            all_keywords[kw] += 1
-
-        decs = _extract_decisions(raw)
-        all_decisions.extend(decs)
-
+        if _is_reaction_or_trivial(raw):
+            # Reactions still get a slot, just a short marker.
+            sender, body = _extract_sender_from_content(raw)
+            # Use the body (which is the emoji/reaction text, not the
+            # bracketed sender) as the marker. The Phase 7 followup
+            # fixes a bug where the raw slice captured "[Levi] " and
+            # produced "[[Levi] reaction]" as the marker.
+            marker_source = body.strip() if body else raw.strip()
+            marker = marker_source[:6] if marker_source else "👍"
+            if not marker:
+                marker = "👍"
+            if sender:
+                lines.append(f"[{sender}]: [{marker} reaction]")
+            else:
+                lines.append(f"[User]: [{marker} reaction]")
+            continue
         if _has_image_reference(raw):
-            image_count += 1
+            sender, body = _extract_sender_from_content(raw)
+            body = " ".join((body or "").split()).strip()
+            if len(body) > 40:
+                body = body[:40].rstrip() + "…"
+            if not body:
+                body = "shared an image"
+            if sender:
+                lines.append(f"[{sender}]: {body} [image]")
+            else:
+                lines.append(f"[User]: {body} [image]")
+            continue
+        # Plain message: full one-liner compression.
+        lines.append(_compress_message_for_summary(raw, max_chars=80))
 
-    if msg_count == 0:
+    if not lines:
         return ""
 
-    # Phase 6: extract Q&A pairs FIRST — they carry the highest information
-    # density and should be preserved as readable sentences instead of
-    # being boiled down to a keyword dump. Token budget is allocated
-    # top-down: Q&A → Decisions → Participants → Topics → Media. Lower
-    # sections get dropped (not truncated) if the budget is tight.
-    qa_pairs = _extract_qa_pairs(messages)
-
-    parts = []
+    # Token-aware packing: greedily add one-liners until we hit the
+    # budget. If we can't fit all of them, truncate the body of each
+    # remaining line to a short tail ("…last 4 words") so EVERY sender
+    # still appears. If even that overflows, fall back to a sender
+    # roster so no participant is silently dropped.
     token_budget = max_tokens
 
-    if qa_pairs:
-        # Each Q&A pair is roughly `Sender: <answer>` ≈ 15-25 tokens.
-        # Pack as many as fit. Cap at 3 pairs (matches the helper's cap).
-        qa_text = "; ".join(qa_pairs)
-        qa_line = f"Q&A: {qa_text}"
-        t = _estimate_tokens(qa_line)
-        if t <= token_budget:
-            parts.append(qa_line)
-            token_budget -= t
+    def estimate(line: str) -> int:
+        return _estimate_tokens(line)
 
-    if all_decisions:
-        dec_text = "; ".join(all_decisions[:2])
-        dec_line = f"Decisions: {dec_text}"
-        t = _estimate_tokens(dec_text)
-        if t <= token_budget:
-            parts.append(dec_line)
-            token_budget -= t
+    def measure_all(items: List[str]) -> int:
+        return estimate("; ".join(items))
 
-    if participants:
-        top = participants.most_common(4)
-        names = [f"{n}({c})" for n, c in top]
-        participant_line = f"Participants: {', '.join(names)}"
-        t = _estimate_tokens(participant_line)
-        if t <= token_budget:
-            parts.append(participant_line)
-            token_budget -= t
+    # First pass: full 80-char-per-line compression.
+    if measure_all(lines) <= token_budget:
+        return "; ".join(lines)
 
-    # Topics are the lowest-value section in the new ordering — a
-    # keyword dump like "Topics: gary, lcb, zach" is what we're trying
-    # to escape. Only include them if there's still room AFTER Q&A +
-    # decisions + participants. The Dov 2026-06-16 fix: explicit cap
-    # at 3 topics (was 5) to free tokens for the higher-signal lines.
-    if all_keywords and token_budget > 0:
-        top_topics = [w for w, c in all_keywords.most_common(3) if c >= 1]
-        if top_topics:
-            topic_line = f"Topics: {', '.join(top_topics)}"
-            t = _estimate_tokens(topic_line)
-            if t <= token_budget:
-                parts.append(topic_line)
-                token_budget -= t
+    # Second pass: shrink each line to 40 chars. Send ALL of them.
+    short = [_compress_message_for_summary(_raw_text(m) or "", max_chars=40)
+             for m in messages
+             if _raw_text(m)]
+    if measure_all(short) <= token_budget:
+        return "; ".join(short)
 
-    if image_count > 0:
-        img_line = f"Media: {image_count} image(s) shared"
-        t = _estimate_tokens(img_line)
-        if t <= token_budget:
-            parts.append(img_line)
-            token_budget -= t
+    # Third pass: shrink to 20 chars. Send ALL of them.
+    tiny = [_compress_message_for_summary(_raw_text(m) or "", max_chars=20)
+            for m in messages
+            if _raw_text(m)]
+    if measure_all(tiny) <= token_budget:
+        return "; ".join(tiny)
 
-    if not parts:
-        return f"{msg_count} earlier messages"
-
-    return ". ".join(parts)
+    # Last resort: build a participant roster so the agent at least
+    # knows who was in the conversation. Never drop a sender.
+    seen: Counter = Counter()
+    for m in messages:
+        raw = _raw_text(m)
+        if not raw:
+            continue
+        sender, _ = _extract_sender_from_content(raw)
+        if sender:
+            seen[sender] += 1
+        else:
+            seen["others"] += 1
+    names = [f"{n}({c})" for n, c in seen.most_common(8)]
+    return f"Participants: {', '.join(names)}"
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +1015,22 @@ def on_pre_llm_call(
             raw = _raw_text(msg)
             if raw and _is_reaction_or_trivial(raw):
                 skipped_trivial += 1
+                # Phase 7 (Dov 2026-06-16): reactions still belong in the
+                # output — just in compressed form in the summary, not
+                # the verbatim window. Push them to older_msg_dicts so
+                # the per-sender one-liner summary emits a
+                # "[Sender]: [👍 reaction]" marker for them. This is
+                # the rule that NO message is silently dropped.
+                msg_ts_r = msg.get("timestamp")
+                within_r = True
+                if msg_ts_r and cutoff > 0:
+                    try:
+                        if isinstance(msg_ts_r, (int, float)):
+                            within_r = msg_ts_r >= cutoff
+                    except (TypeError, ValueError):
+                        pass
+                if within_r:
+                    older_msg_dicts.append(msg)
             continue
 
         within_time_window = True
@@ -1015,8 +1097,16 @@ def on_pre_llm_call(
 
     # ── Pass 2: Summary ──
     summary = ""
-    if summary_enabled and len(older_msg_dicts) >= summary_min_messages:
-        summary = _summarize_messages(older_msg_dicts, max_tokens=summary_max_tokens)
+    if summary_enabled and (
+        len(older_msg_dicts) >= summary_min_messages
+        or skipped_trivial > 0  # reactions need a slot too
+    ):
+        # Phase 7: older_msg_dicts was built by iterating conversation_history
+        # in REVERSED order (newest first), but the per-sender one-liner
+        # summary reads better in arrival order (oldest first) — the
+        # agent can follow the conversation flow. Flip it back.
+        older_chronological = list(reversed(older_msg_dicts))
+        summary = _summarize_messages(older_chronological, max_tokens=summary_max_tokens)
         summary_tokens = _estimate_tokens(summary)
     else:
         summary_tokens = 0

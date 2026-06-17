@@ -34,10 +34,17 @@ block below.
 | 3 | Image description injection from cached images | implemented |
 | 4 | Per-platform config overrides, edge case hardening | implemented |
 | 5 | Priority scoring, adaptive window, entity tracking | implemented |
+| 6 | Q&A preservation in summary (Phase 6 — `Levi: Sleep…` survives compression) | implemented |
+| 7 | **Every message is present in context** (no silent drops) | implemented |
 
-All five phases ship in the current code. Phase 1 alone gives most of the
-value; phases 2-5 are progressive refinements that can be disabled in
-config.
+Phases 1-5 ship in the base code; phases 6-7 are progressive refinements.
+Phase 7 is the most important behavior guarantee: **no message is silently
+dropped from the output**. A low-priority message can be compressed to a
+per-sender one-liner in the summary, but it always has a slot. The
+previous failure mode was `Topics: lcb, gary, levi` (keyword dump that
+loses the actual content); Phase 7 emits
+`[Levi]: Zach drives a Tesla Model Y, plate LBE2036` instead, so the
+agent can answer "what did Levi say about Zach's car?" even minutes later.
 
 ## Install
 
