@@ -233,8 +233,33 @@ def _is_reaction_or_trivial(content: str) -> bool:
     return False
 
 
+# Patterns observed in conversation_history user content across platforms.
+# Order matters — try the most specific (group-observer pipe form) first,
+# then fall back to the legacy display-name-only form.
+#
+# group_observer.py:_attributed_text produces
+#     "[display_name|user_id]\n<text>"
+# so the captured sender group is "display_name|user_id". Stripping the
+# "|user_id" suffix gives us the human-readable display name and lets the
+# entity-tracking Counter and formatted-window lines speak in real names
+# ("Levi" instead of "Levi|30533643984944@lid"). Without this, every
+# priority-score lookup against entity_counts uses a unique long key,
+# so the frequent-participant bonus never fires and Levi's short
+# answer gets pushed out of the window into the summary.
+_SENDER_PIPE_RE = re.compile(r'^\[([^\]|]+)\|[^\]]+\]\s*(.*)', re.DOTALL)
+_SENDER_PLAIN_RE = re.compile(r'^\[([^\]]+)\]\s*(.*)', re.DOTALL)
+
+
 def _extract_sender_from_content(content: str) -> Tuple[str, str]:
-    m = re.match(r'^\[([^\]]+)\]\s*(.*)', content, re.DOTALL)
+    # Try the most specific form first: "[display_name|user_id]".
+    # The pipe-regex requires at least one char in the display-name slot
+    # ([^\]|]+), so an empty-name form like "[|abc@lid]" falls through
+    # to the plain form, which returns "|abc@lid" verbatim — acceptable
+    # as a raw identifier (no real conversation produces this anyway).
+    m = _SENDER_PIPE_RE.match(content)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = _SENDER_PLAIN_RE.match(content)
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return "", content
@@ -784,6 +809,19 @@ def on_pre_llm_call(
                 age_minutes = (now - msg_ts) / 60
                 recency_boost = max(0, 3.0 - (age_minutes / time_window_minutes * 3.0)) if time_window_minutes > 0 else 0
                 score += recency_boost
+            # Dov 2026-06-16: guaranteed slot for the immediate predecessor
+            # of the current turn. The thing that came RIGHT BEFORE the
+            # user is almost always what the user is reacting to — Levi's
+            # "Sleep" answer to "what's better than sex?" was the second
+            # message in the window (total_user_msgs==2) and got dropped
+            # by score competition in a 13-message conversation even
+            # though it was the entire point of the question. The
+            # predecessor boost adds +5 (well above any other signal)
+            # so the most-recent non-current message always wins a
+            # window slot. Fallback: if a predecessor is filtered out
+            # (truncated/empty), the next one upstream takes the slot.
+            if total_user_msgs == 2:
+                score += 5.0
             candidates.append((score, total_user_msgs, formatted, msg))
         else:
             older_msg_dicts.append(msg)
